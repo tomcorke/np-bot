@@ -10,12 +10,14 @@ export interface RawPlayerGameData {
   }
 }
 
-export type RawPlayerData = [
+interface RawPlayerData {
+  games_in: number
+  user_id: string
+  alias: string
+  open_games: RawPlayerGameData[]
+}
+
+export type InitPlayerResponse = [
   'meta_init_player',
-  {
-    games_in: number
-    user_id: string
-    alias: string
-    open_games: RawPlayerGameData[]
-  }
+  RawPlayerData
 ]

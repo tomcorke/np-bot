@@ -2,15 +2,15 @@ import Discord from 'discord.js'
 import { map as bluebirdMap } from 'bluebird'
 import chalk from 'chalk'
 
-import NeptunesPrideApi from './api'
 import { initDiscord, getGuildHelpers } from './discord'
 import {
   decodeHTMLEntities
 } from './util'
 
-import { config } from './config'
-import { getGuildConfig, GuildConfig } from './config/guild'
+import { initGuild, GuildConfig } from './config/guild'
 import { MissingPermissionsError } from './errors';
+import { GAME_EVENTS, Game } from './np-api/game';
+import NeptunesPrideApi from './np-api';
 
 require('dotenv-safe').config()
 
@@ -25,27 +25,6 @@ const {
   NEPTUNES_PRIDE_PASSWORD,
 } = process.env
 
-const initApi = async () => {
-  const api = new NeptunesPrideApi()
-
-  await api.getAuthToken(NEPTUNES_PRIDE_USERNAME, NEPTUNES_PRIDE_PASSWORD)
-  const player = await api.initPlayer()
-
-  if (player.games_in === 1) {
-    const gameId = player.open_games[0].number
-    api.setGameId(gameId)
-  } else if(player.games_in === 0) {
-    throw Error('Player is in no games!')
-  } else {
-    throw Error('Multiple games, prompt here')
-  }
-
-  await api.getUniverse()
-  console.log('Universe ready')
-
-  return { npApi: api, player}
-}
-
 const send = (channel: Discord.TextChannel, content: string | Discord.RichEmbed) => {
   console.log(`Sending message to ${channel.name}:`)
   if (typeof content === 'object') {
@@ -56,20 +35,33 @@ const send = (channel: Discord.TextChannel, content: string | Discord.RichEmbed)
   return channel.send(content)
 }
 
+const initNeptunesPrideApi = async () => {
+  const api = new NeptunesPrideApi()
+
+  await api.getAuthToken(NEPTUNES_PRIDE_USERNAME, NEPTUNES_PRIDE_PASSWORD)
+  const player = await api.initPlayer()
+
+  player.open_games.forEach(game => api.addGame(game.number, decodeHTMLEntities(game.name)))
+
+  return { npApi: api, player}
+}
+
 ;(async () => {
   try {
-    const { npApi, player } = await initApi()
+    const { npApi, player } = await initNeptunesPrideApi()
     const { discordClient } = await initDiscord()
 
     await bluebirdMap(
       discordClient.guilds.array(),
       async guild => {
 
-        const helpers = getGuildHelpers(guild)
-
         let guildConfig: GuildConfig
+        let commandChannel: Discord.TextChannel
         try {
-          guildConfig = await getGuildConfig(guild)
+          ({
+            guildConfig,
+            commandChannel
+          } = await initGuild(guild))
         } catch (e) {
           if (e instanceof MissingPermissionsError) {
             console.log(chalk.red(`Bot not running for server "${guild.name}" due to missing permissions`))
@@ -78,22 +70,19 @@ const send = (channel: Discord.TextChannel, content: string | Discord.RichEmbed)
           throw e
         }
 
-        const botCommandChannel = await helpers.getOrCreateTextChannel(config.defaultCommandChannelName)
-        const categoryId = botCommandChannel.parentID
-
         const pendingMessageDeletions: Promise<any>[] = []
-        const existingMessages = await botCommandChannel.fetchMessages()
+        const existingMessages = await commandChannel.fetchMessages()
         existingMessages.forEach(m => {
           if (m.deletable) pendingMessageDeletions.push(m.delete())
         })
         await Promise.all(pendingMessageDeletions)
-        await botCommandChannel.send('Hello world!')
-        await botCommandChannel.send('Listing active Neptune\'s Pride games:')
+        await commandChannel.send('Hello world!')
+        await commandChannel.send('Listing active Neptune\'s Pride games:')
 
         const pendingGameListMessages: Promise<any>[] = []
         player.open_games.forEach(game => {
-          pendingGameListMessages.push(send(botCommandChannel, new Discord.RichEmbed()
-            .setTitle(game.name)
+          pendingGameListMessages.push(send(commandChannel, new Discord.RichEmbed()
+            .setTitle(decodeHTMLEntities(game.name))
             .setURL(`https://np.ironhelmet.com/game/${game.number}`)
             .setDescription(decodeHTMLEntities(game.config.description))
             .addField('Players', `${game.players}/${game.maxPlayers}`, true)
@@ -104,6 +93,47 @@ const send = (channel: Discord.TextChannel, content: string | Discord.RichEmbed)
       },
       { concurrency: 1 }
     )
+
+    const guildEventListen = (event: GAME_EVENTS, listener: (guild: Discord.Guild, game: Game, ...args: any[]) => Promise<void> | void) => {
+      npApi.on(event, async (game: Game, ...args: any[]) => {
+        try {
+          await bluebirdMap(
+            discordClient.guilds.array(),
+            async guild => {
+              try {
+                await listener(guild, game, ...args)
+              } catch (e) {
+                console.error(`Error handling event "${event}" for guild "${guild.name}"`, e)
+              }
+            },
+            { concurrency: 1 }
+          )
+        } catch (e) {
+          console.error(`Error handling event "${event}"`, e)
+        }
+      })
+    }
+
+    // Fetch initial universes
+    await bluebirdMap(
+      npApi.games.values(),
+      async game => {
+        await game.loadOrGetUniverse()
+      }
+    )
+
+    // Register game event handlers
+    guildEventListen(GAME_EVENTS.TURN_CHANGE, async (guild: Discord.Guild, game: Game, tick: number) => {
+      const helpers = getGuildHelpers(guild)
+      const logChannel = await helpers.getOrCreateTextChannel('bot-log')
+      logChannel.send(`Tick tock! Turn change in game "${game.universe.name}", now on tick ${tick}`)
+    })
+
+    // Start auto-refresh of games
+    for (let game of npApi.games.values()) {
+      game.startRefresh()
+    }
+
 
   } catch (e) {
     console.error(e)
