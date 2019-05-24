@@ -1,14 +1,23 @@
 import Discord from 'discord.js'
 import chalk from 'chalk'
 
+export interface GameConfig {
+  controlMessageId?: string
+  notificationsEnabled: boolean
+  notificationChannelId?: string
+}
+
 export interface GuildConfig {
   name: string
-  commandChannelId: string
+  commandChannelId?: string
+  games: { [gameId: string]: GameConfig }
 }
 
 import { config, saveConfig } from '.'
 import { MissingPermissionsError } from '../errors'
 import { getGuildHelpers } from '../discord'
+
+const guildConfigs: { [guildId: string]: GuildConfig } = {}
 
 const expectedPermissions = [
   'MANAGE_CHANNELS',
@@ -21,13 +30,9 @@ const expectedPermissions = [
   'MANAGE_NICKNAMES',
 ] as const
 
-export const initGuild = async (guild: Discord.Guild) => {
+const initGuild = async (guild: Discord.Guild) => {
 
-  const guildConfig: Partial<GuildConfig> = config.guilds.get(guild.id) || {}
-
-  guildConfig.name = guild.name
-
-  const helpers = getGuildHelpers(guild)
+  const partialGuildConfig: Partial<GuildConfig> = config.guilds[guild.id] || {}
 
   const botMember = guild.me
 
@@ -38,36 +43,72 @@ export const initGuild = async (guild: Discord.Guild) => {
     throw new MissingPermissionsError(`Bot is missing expected permissions in server "${guild.name}": ${JSON.stringify(missingPermissions)}`)
   }
 
-  let commandChannelId = guildConfig.commandChannelId
-  let commandChannel: Discord.TextChannel | undefined
-  if (commandChannelId) {
-    commandChannel = guild.channels.get(commandChannelId) as Discord.TextChannel | undefined
-  }
-  if (!commandChannel) {
-    commandChannel = await helpers.getOrCreateTextChannel(config.defaultCommandChannelName)
-    guildConfig.commandChannelId = commandChannel.id
+  const guildConfig: GuildConfig = {
+    ...partialGuildConfig,
+    name: guild.name,
+    games: partialGuildConfig.games || {}
   }
 
-  config.guilds.set(guild.id, guildConfig as GuildConfig)
+  config.guilds[guild.id] = guildConfig
+  guildConfigs[guild.id] = guildConfig
 
-  // Set user name and presence
+  const setRandomPresence = async () => {
+    const gameMessages = [
+      'in ur galaxy',
+      'with ur industries',
+      'with ur ships',
+      'as an evil overlord',
+      'with your heart',
+      'a tiny violin',
+      'internet spaceships'
+    ]
+    try {
+      await guild.client.user.setPresence({ game: { name: gameMessages[Math.floor(Math.random() * gameMessages.length)] }, status: 'online' })
+    } catch (e) {
+      // Whatever
+    }
+  }
 
-  // await botMember.setNickname('Neptune\'s Pride Watcher')
-  const gameMessages = [
-    'in ur galaxy',
-    'with ur industries',
-    'with ur ships',
-    'as an evil overlord',
-    'the good guy',
-    'internet spaceships'
-  ]
-
-  await guild.client.user.setPresence({ game: { name: gameMessages[Math.floor(Math.random() * gameMessages.length)] }, status: 'online' })
+  await setRandomPresence()
+  setInterval(setRandomPresence, 60000)
 
   saveConfig()
 
-  return {
-    guildConfig: guildConfig as GuildConfig,
-    commandChannel,
+  return guildConfig
+}
+
+export const getGuildConfig = async (guild: Discord.Guild) => {
+  const guildConfig = guildConfigs[guild.id] || await initGuild(guild)
+  config.guilds[guild.id] = guildConfig
+  return guildConfig
+}
+
+export const getCommandChannel = async (guild: Discord.Guild) => {
+  const guildConfig = guildConfigs[guild.id] || await initGuild(guild)
+  const helpers = getGuildHelpers(guild)
+  const commandChannel = await helpers.getOrCreateTextChannel(config.defaultCommandChannelName, guildConfig.commandChannelId)
+  if (!commandChannel) {
+    throw Error(`Could not get or create command channel for guild ${guild.name}`)
   }
+  guildConfig.commandChannelId = commandChannel.id
+  return commandChannel
+}
+
+export const getGameNotificationChannel = async (guild: Discord.Guild, gameId: string) => {
+  const guildConfig = guildConfigs[guild.id] || await initGuild(guild)
+  const guildGameConfig = getGameConfig(guildConfig, gameId)
+  const helpers = getGuildHelpers(guild)
+  const gameNotificationChannel = await helpers.getOrCreateTextChannel(config.defaultNotificationChannelName, guildGameConfig.notificationChannelId)
+  if (!gameNotificationChannel) {
+    throw Error(`Could not get or create game notification channel for guild ${guild.name}, game ${gameId}`)
+  }
+  guildGameConfig.notificationChannelId = gameNotificationChannel.id
+  return gameNotificationChannel
+}
+
+export const getGameConfig = (guildConfig: GuildConfig, gameId: string) => {
+  const gameConfig = guildConfig.games[gameId] = guildConfig.games[gameId] || {
+    notificationsEnabled: true
+  }
+  return gameConfig
 }

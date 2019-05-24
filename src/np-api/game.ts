@@ -1,7 +1,7 @@
 import { EventEmitter } from "events";
 import * as path from 'path'
 import * as fs from 'fs'
-import { promisify } from 'util'
+import { promisify, inspect } from 'util'
 import * as shelljs from 'shelljs'
 
 const writeFileP = promisify(fs.writeFile)
@@ -11,7 +11,6 @@ import { Universe, Star, Fleet } from "./universe";
 import {
   RawUniverseData,
   EMPTY_UNIVERSE_DATA,
-  EMPTY_UNIVERSE_ID,
 } from "./universe/universe";
 
 import NeptunesPrideApi, { DEFAULT_REQUEST_HEADERS, encodeFormData } from ".";
@@ -24,6 +23,10 @@ interface ApiOrderResponse {
 export enum GAME_EVENTS {
   TURN_CHANGE = 'TURN_CHANGE',
   TICK_CHANGE = 'TICK_CHANGE',
+  UNIVERSE_REFRESH_START = 'UNIVERSE_REFRESH_START',
+  UNIVERSE_REFRESH_ERROR = 'UNIVERSE_REFRESH_ERROR',
+  UNIVERSE_REFRESH_COMPLETE = 'UNIVERSE_REFRESH_COMPLETE',
+  UNIVERSE_UPDATE = 'UNIVERSE_UPDATE',
 }
 
 const ORDER_URI = 'https://np.ironhelmet.com/trequest/order'
@@ -34,7 +37,7 @@ function sum(items: number[]) {
   }, 0)
 }
 
-const AUTO_REFRESH_DELAY = 10000
+const AUTO_REFRESH_DELAY = 30000
 
 export class Game extends EventEmitter {
   api: NeptunesPrideApi
@@ -49,7 +52,11 @@ export class Game extends EventEmitter {
     this.api = api
     this.gameId = gameId
     this.name = name
-    this.universe = universe || new Universe(EMPTY_UNIVERSE_ID, EMPTY_UNIVERSE_DATA)
+    this.universe = universe || new Universe(this.gameId, EMPTY_UNIVERSE_DATA)
+  }
+
+  [inspect.custom](): string {
+    return `<Game: ${this.gameId} "${this.name}">`
   }
 
   setUniverse(universe: Universe) {
@@ -61,14 +68,17 @@ export class Game extends EventEmitter {
 
       const newUniverse = new Universe(this.gameId, res.report)
 
-      if (this.universe.isReal
-        && this.universe.isSameGame(newUniverse)
-        && this.universe.tick !== newUniverse.tick) {
+      if (this.universe.isReal) {
 
-        if (this.universe.turnBased) {
-          this.emit(GAME_EVENTS.TURN_CHANGE, newUniverse.tick)
+        this.emit(GAME_EVENTS.UNIVERSE_UPDATE)
+
+        if (this.universe.isSameGame(newUniverse)
+          && this.universe.tick !== newUniverse.tick) {
+          if (this.universe.turnBased) {
+            this.emit(GAME_EVENTS.TURN_CHANGE, newUniverse.tick)
+          }
+          this.emit(GAME_EVENTS.TICK_CHANGE, newUniverse.tick)
         }
-        this.emit(GAME_EVENTS.TICK_CHANGE, newUniverse.tick)
       }
 
       this.universe = newUniverse
@@ -102,7 +112,6 @@ export class Game extends EventEmitter {
   }
 
   async sendOrder(order: string) : Promise<Universe> {
-    console.log('sendOrder', this.gameId, order)
 
     const authToken = this.api.authToken
     if (!authToken) {
@@ -133,7 +142,6 @@ export class Game extends EventEmitter {
   }
 
   async getUniverse() : Promise<Universe> {
-    console.log('getUniverse', this.gameId)
     return this.sendOrder('full_universe_report')
   }
 
@@ -173,14 +181,12 @@ export class Game extends EventEmitter {
 
   async saveUniverse() : Promise<any> {
     const filePath = this.getUniverseFilePath()
-    console.log('saveUniverse', this.gameId, filePath)
     await shelljs.mkdir('-p', path.dirname(filePath))
     return writeFileP(filePath, JSON.stringify(this.universe.rawData, null, 2), 'utf8')
   }
 
   async loadUniverse() : Promise<Universe> {
     const filePath = this.getUniverseFilePath()
-    console.log('loadUniverse', this.gameId, filePath)
     if (!fs.existsSync(filePath))
       throw Error(`Could not load universe from "${filePath}", file does not exist.`)
     return readFileP(filePath, 'utf8')
@@ -212,9 +218,11 @@ export class Game extends EventEmitter {
     this.stopRefresh()
     this.refreshTimer = setInterval(async () => {
       try {
-        console.log(`Refreshing universe for game ${this.gameId}`)
+        this.emit(GAME_EVENTS.UNIVERSE_REFRESH_START)
         await this.getUniverse()
+        this.emit(GAME_EVENTS.UNIVERSE_REFRESH_COMPLETE)
       } catch (e) {
+        this.emit(GAME_EVENTS.UNIVERSE_REFRESH_ERROR)
         console.error(`Error refreshing game ${this.gameId}`, e)
       }
     }, AUTO_REFRESH_DELAY)

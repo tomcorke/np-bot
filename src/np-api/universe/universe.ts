@@ -60,8 +60,6 @@ export const EMPTY_UNIVERSE_DATA: RawUniverseData = {
   tick_rate: 0,
 }
 
-export const EMPTY_UNIVERSE_ID = 'x'
-
 export class Universe {
 
   gameId: string
@@ -97,10 +95,9 @@ export class Universe {
     this.gameId = gameId
     this.name = decodeHTMLEntities(data.name)
 
-    if (process.env.NODE_ENV === 'development' && this.gameId !== EMPTY_UNIVERSE_ID) {
+    if (process.env.NODE_ENV === 'development' && this.isReal) {
       const safeGameName = decodeHTMLEntities(data.name).replace(/[[\]'" ?:|<>]/g, '_')
       const universePath = path.join(__dirname, `../../../cache/debug/universe/${safeGameName}_tick_${data.tick}.json`)
-      console.log(`DEV: Saving universe data at "${universePath}"`)
       shelljs.mkdir('-p', path.dirname(universePath))
       fs.writeFileSync(universePath, JSON.stringify(data, null, 2), 'utf8')
     }

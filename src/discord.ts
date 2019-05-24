@@ -42,12 +42,15 @@ export const getTextChannels = (discordClient: Discord.Client, guild: Discord.Gu
   return guild.channels.filter(c => c.type === 'text') as Discord.Collection<string, Discord.TextChannel>
 }
 
-export const getTextChannel = (discordClient: Discord.Client, guild: Discord.Guild, name: string) => {
-  return getTextChannels(discordClient, guild).find(c => c.name === name) as Discord.TextChannel | undefined
+export const getTextChannel = (discordClient: Discord.Client, guild: Discord.Guild, name: string, id?: string) => {
+  const textChannels = getTextChannels(discordClient, guild)
+  const channelById = textChannels.find(c => id !== undefined && c.id === id)
+  if (channelById) return channelById
+  return textChannels.find(c => c.name === name) as Discord.TextChannel | undefined
 }
 
-export const getOrCreateTextChannel = async (discordClient: Discord.Client, guild: Discord.Guild, name: string, options?: Discord.ChannelData) => {
-  let channel = getTextChannel(discordClient, guild, name)
+export const getOrCreateTextChannel = async (discordClient: Discord.Client, guild: Discord.Guild, name: string, id?: string, options?: Discord.ChannelData) => {
+  let channel = getTextChannel(discordClient, guild, name, id)
   if (channel) return channel
   channel = await guild.createChannel(name, { ...options, type: 'text' }) as Discord.TextChannel
   return channel

@@ -7,10 +7,12 @@ import {
   decodeHTMLEntities
 } from './util'
 
-import { initGuild, GuildConfig } from './config/guild'
+import { saveConfig } from './config'
+import { GuildConfig, getCommandChannel, getGameConfig, getGameNotificationChannel, getGuildConfig } from './config/guild'
 import { MissingPermissionsError } from './errors';
 import { GAME_EVENTS, Game } from './np-api/game';
 import NeptunesPrideApi from './np-api';
+import { RawPlayerGameData } from './np-api/player';
 
 require('dotenv-safe').config()
 
@@ -18,6 +20,7 @@ declare var process: {
   env: {
     NEPTUNES_PRIDE_USERNAME: string
     NEPTUNES_PRIDE_PASSWORD: string
+    NODE_ENV?: string
   }
 }
 const {
@@ -38,17 +41,114 @@ const send = (channel: Discord.TextChannel, content: string | Discord.RichEmbed)
 const initNeptunesPrideApi = async () => {
   const api = new NeptunesPrideApi()
 
+  if (process.env.NODE_ENV === 'development') {
+    Object.values(GAME_EVENTS).forEach(event => api.on(event, (...args: any[]) => console.log('API EVENT', event, ...args)))
+  }
+
   await api.getAuthToken(NEPTUNES_PRIDE_USERNAME, NEPTUNES_PRIDE_PASSWORD)
-  const player = await api.initPlayer()
+  return api
+}
 
-  player.open_games.forEach(game => api.addGame(game.number, decodeHTMLEntities(game.name)))
+const updateGuildControlMessage = async (guild: Discord.Guild, message: Discord.Message, game: RawPlayerGameData) => {
+  const guildConfig = await getGuildConfig(guild)
+  const gameConfig = await getGameConfig(guildConfig, game.number)
 
-  return { npApi: api, player}
+  const notificationChannel = await getGameNotificationChannel(guild, game.number)
+
+  const messageContent = new Discord.RichEmbed()
+    .setTitle(decodeHTMLEntities(game.name))
+    .setURL(`https://np.ironhelmet.com/game/${game.number}`)
+    .setDescription(decodeHTMLEntities(game.config.description))
+    .addField('Players', `${game.players}/${game.maxPlayers}`, true)
+    .addField('Status', game.status, true)
+    .addField('Notifications', gameConfig.notificationsEnabled, true)
+    .addField('Notification channel', `#${notificationChannel.name}`, true)
+
+
+  await message.edit(messageContent)
+}
+
+const createOrUpdateGuildGameControlMessage = async (guild: Discord.Guild, commandChannel: Discord.TextChannel, game: RawPlayerGameData) => {
+
+  const guildConfig = await getGuildConfig(guild)
+  const gameConfig = await getGameConfig(guildConfig, game.number)
+
+  let gameMessage: Discord.Message | Discord.Message[] | undefined
+
+  const controlMessageId = gameConfig.controlMessageId
+  if (controlMessageId) {
+    try {
+      gameMessage = await commandChannel.fetchMessage(controlMessageId)
+    } catch (e) {
+      console.error(`Error fetching game control message with ID ${controlMessageId} in guild "${guildConfig.name}"`)
+    }
+  }
+  if (!gameMessage) {
+    gameMessage = await send(commandChannel, '')
+  }
+
+  const messages = ([] as Discord.Message[]).concat(gameMessage)
+  if (messages.length === 0) throw Error(`No game control message for game "${game.name}" in guild "${guildConfig.name}"`)
+  if (messages.length > 1) throw Error(`Unexpected more than one game control message for game "${game.name}" in guild "${guildConfig.name}"!`)
+
+  const message = messages[0]
+  await updateGuildControlMessage(guild, message, game)
+
+  gameConfig.controlMessageId = message.id
+  saveConfig()
+
+  const CONTROL_REACTIONS = ['💬']
+  const CONTROL_ACTIONS: { [key: string]: () => Promise<void> } = {
+    '💬': async () => {
+      gameConfig.notificationsEnabled = !gameConfig.notificationsEnabled
+      saveConfig()
+      await updateGuildControlMessage(guild, message, game)
+    }
+  }
+
+  // Clear all existing reactions that aren't by the bot
+  await Promise.all(message.reactions
+    .map(async r => {
+      const users = await r.fetchUsers()
+      return Promise.all(users
+        .filter(u => (
+          u.id !== commandChannel.guild.me.id
+          || !CONTROL_REACTIONS.includes(r.emoji.name)
+        ))
+        .map(u => r.remove(u))
+      )
+    })
+  )
+
+  // Add control reactions
+  await Promise.all(CONTROL_REACTIONS.map(r => message.react(r)))
+
+  // Create filter for other user's reactions
+  const filter: Discord.CollectorFilter = (reaction: Discord.MessageReaction, user: Discord.User) => {
+    if (user.id === message.author.id) return false
+    return true
+  }
+  const collector = message.createReactionCollector(filter)
+  collector.on('collect', async (reaction, collector) => {
+    try {
+      // If unrecognised reaction, remove all occurences of it!
+      if (!CONTROL_REACTIONS.includes(reaction.emoji.name)) return await Promise.all(reaction.users.map(user => reaction.remove(user)))
+      // Otherwise handle the reaction and remove only instances of this reaction that aren't from the bot
+      await CONTROL_ACTIONS[reaction.emoji.name]()
+      await Promise.all(reaction.users.filter(u => u.id !== commandChannel.guild.me.id).map(user => reaction.remove(user)))
+    } catch (e) {
+      console.error(`Error removing reaction "${reaction.emoji.name}" from message ${reaction.message.id}`)
+    }
+  })
+
+  return gameMessage
 }
 
 ;(async () => {
   try {
-    const { npApi, player } = await initNeptunesPrideApi()
+    const npApi = await initNeptunesPrideApi()
+    await npApi.updatePlayerGames()
+
     const { discordClient } = await initDiscord()
 
     await bluebirdMap(
@@ -58,10 +158,8 @@ const initNeptunesPrideApi = async () => {
         let guildConfig: GuildConfig
         let commandChannel: Discord.TextChannel
         try {
-          ({
-            guildConfig,
-            commandChannel
-          } = await initGuild(guild))
+          guildConfig = await getGuildConfig(guild)
+          commandChannel = await getCommandChannel(guild)
         } catch (e) {
           if (e instanceof MissingPermissionsError) {
             console.log(chalk.red(`Bot not running for server "${guild.name}" due to missing permissions`))
@@ -70,25 +168,12 @@ const initNeptunesPrideApi = async () => {
           throw e
         }
 
-        const pendingMessageDeletions: Promise<any>[] = []
-        const existingMessages = await commandChannel.fetchMessages()
-        existingMessages.forEach(m => {
-          if (m.deletable) pendingMessageDeletions.push(m.delete())
-        })
-        await Promise.all(pendingMessageDeletions)
-        await commandChannel.send('Hello world!')
-        await commandChannel.send('Listing active Neptune\'s Pride games:')
-
-        const pendingGameListMessages: Promise<any>[] = []
-        player.open_games.forEach(game => {
-          pendingGameListMessages.push(send(commandChannel, new Discord.RichEmbed()
-            .setTitle(decodeHTMLEntities(game.name))
-            .setURL(`https://np.ironhelmet.com/game/${game.number}`)
-            .setDescription(decodeHTMLEntities(game.config.description))
-            .addField('Players', `${game.players}/${game.maxPlayers}`, true)
-          ))
-        })
-        await Promise.all(pendingGameListMessages)
+        await bluebirdMap(
+          npApi.player.open_games.sort((a, b) => a.number < b.number ? -1 : 1),
+          async game => {
+            await createOrUpdateGuildGameControlMessage(guild, commandChannel, game)
+          }
+        )
 
       },
       { concurrency: 1 }
