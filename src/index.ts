@@ -63,6 +63,7 @@ const updateGuildControlMessage = async (guild: Discord.Guild, message: Discord.
     .addField('Status', game.status, true)
     .addField('Notifications', gameConfig.notificationsEnabled, true)
     .addField('Notification channel', `#${notificationChannel.name}`, true)
+    .setTimestamp(Date.now())
 
 
   await message.edit(messageContent)
@@ -84,9 +85,14 @@ const createOrUpdateGuildGameControlMessage = async (guild: Discord.Guild, comma
     }
   }
   if (!gameMessage) {
-    gameMessage = await send(commandChannel, '')
+    gameMessage = await send(commandChannel, new Discord.RichEmbed()
+      .setTitle(decodeHTMLEntities(game.name))
+      .setURL(`https://np.ironhelmet.com/game/${game.number}`)
+      .setDescription('Fetching game config...')
+    )
   }
 
+  // Normalise get/create return formats to single message
   const messages = ([] as Discord.Message[]).concat(gameMessage)
   if (messages.length === 0) throw Error(`No game control message for game "${game.name}" in guild "${guildConfig.name}"`)
   if (messages.length > 1) throw Error(`Unexpected more than one game control message for game "${game.name}" in guild "${guildConfig.name}"!`)
@@ -141,7 +147,7 @@ const createOrUpdateGuildGameControlMessage = async (guild: Discord.Guild, comma
     }
   })
 
-  return gameMessage
+  return message
 }
 
 ;(async () => {
@@ -171,7 +177,11 @@ const createOrUpdateGuildGameControlMessage = async (guild: Discord.Guild, comma
         await bluebirdMap(
           npApi.player.open_games.sort((a, b) => a.number < b.number ? -1 : 1),
           async game => {
-            await createOrUpdateGuildGameControlMessage(guild, commandChannel, game)
+            const controlMessage = await createOrUpdateGuildGameControlMessage(guild, commandChannel, game)
+            const gameApi = npApi.games.get(game.number)
+            if (gameApi) {
+              gameApi.on(GAME_EVENTS.TICK_CHANGE, () => updateGuildControlMessage(guild, controlMessage, game))
+            }
           }
         )
 
