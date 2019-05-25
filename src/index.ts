@@ -13,6 +13,7 @@ import { MissingPermissionsError } from './errors';
 import { GAME_EVENTS, Game } from './np-api/game';
 import NeptunesPrideApi from './np-api';
 import { RawPlayerGameData } from './np-api/player';
+import { getOrCreateCommandMessage } from './discord/command-message';
 
 require('dotenv-safe').config()
 
@@ -49,105 +50,57 @@ const initNeptunesPrideApi = async () => {
   return api
 }
 
-const updateGuildControlMessage = async (guild: Discord.Guild, message: Discord.Message, game: RawPlayerGameData) => {
+const getGuildGameControlMessageContent = async (guild: Discord.Guild, game: RawPlayerGameData, api: NeptunesPrideApi) => {
   const guildConfig = await getGuildConfig(guild)
   const gameConfig = await getGameConfig(guildConfig, game.number)
+  const gameObject = await api.games.get(game.number)
 
   const notificationChannel = await getGameNotificationChannel(guild, game.number)
 
-  const messageContent = new Discord.RichEmbed()
+  const content = new Discord.RichEmbed()
     .setTitle(decodeHTMLEntities(game.name))
     .setURL(`https://np.ironhelmet.com/game/${game.number}`)
     .setDescription(decodeHTMLEntities(game.config.description))
     .addField('Players', `${game.players}/${game.maxPlayers}`, true)
     .addField('Status', game.status, true)
+
+  if (gameObject && gameObject.universe.isReal) {
+    content.addField('Game tick', gameObject.universe.tick, true)
+    if (gameObject.universe.turnBased) {
+      content.addField('Game turn', gameObject.universe.tick / gameObject.universe.tickRate, true)
+    }
+  }
+
+  content
     .addField('Notifications', gameConfig.notificationsEnabled, true)
     .addField('Notification channel', `#${notificationChannel.name}`, true)
     .setTimestamp(Date.now())
 
-
-  await message.edit(messageContent)
+  return content
 }
 
-const createOrUpdateGuildGameControlMessage = async (guild: Discord.Guild, commandChannel: Discord.TextChannel, game: RawPlayerGameData) => {
+const getGuildGameControlMessage = async (channel: Discord.TextChannel, game: RawPlayerGameData, api: NeptunesPrideApi) => {
 
-  const guildConfig = await getGuildConfig(guild)
+  const guildConfig = await getGuildConfig(channel.guild)
   const gameConfig = await getGameConfig(guildConfig, game.number)
 
-  let gameMessage: Discord.Message | Discord.Message[] | undefined
-
-  const controlMessageId = gameConfig.controlMessageId
-  if (controlMessageId) {
-    try {
-      gameMessage = await commandChannel.fetchMessage(controlMessageId)
-    } catch (e) {
-      console.error(`Error fetching game control message with ID ${controlMessageId} in guild "${guildConfig.name}"`)
+  const { message, update } = await getOrCreateCommandMessage({
+    channel,
+    messageContentProducer: () => getGuildGameControlMessageContent(channel.guild, game, api),
+    messageId: gameConfig.controlMessageId,
+    reactions: {
+      '💬': async (update) => {
+        gameConfig.notificationsEnabled = !gameConfig.notificationsEnabled
+        saveConfig()
+        return update()
+      }
     }
-  }
-  if (!gameMessage) {
-    gameMessage = await send(commandChannel, new Discord.RichEmbed()
-      .setTitle(decodeHTMLEntities(game.name))
-      .setURL(`https://np.ironhelmet.com/game/${game.number}`)
-      .setDescription('Fetching game config...')
-    )
-  }
-
-  // Normalise get/create return formats to single message
-  const messages = ([] as Discord.Message[]).concat(gameMessage)
-  if (messages.length === 0) throw Error(`No game control message for game "${game.name}" in guild "${guildConfig.name}"`)
-  if (messages.length > 1) throw Error(`Unexpected more than one game control message for game "${game.name}" in guild "${guildConfig.name}"!`)
-
-  const message = messages[0]
-  await updateGuildControlMessage(guild, message, game)
+  })
 
   gameConfig.controlMessageId = message.id
   saveConfig()
 
-  const CONTROL_REACTIONS = ['💬']
-  const CONTROL_ACTIONS: { [key: string]: () => Promise<void> } = {
-    '💬': async () => {
-      gameConfig.notificationsEnabled = !gameConfig.notificationsEnabled
-      saveConfig()
-      await updateGuildControlMessage(guild, message, game)
-    }
-  }
-
-  // Clear all existing reactions that aren't by the bot
-  await Promise.all(message.reactions
-    .map(async r => {
-      const users = await r.fetchUsers()
-      return Promise.all(users
-        .filter(u => (
-          u.id !== commandChannel.guild.me.id
-          || !CONTROL_REACTIONS.includes(r.emoji.name)
-        ))
-        .map(u => r.remove(u))
-      )
-    })
-  )
-
-  // Add control reactions
-  await Promise.all(CONTROL_REACTIONS.map(r => message.react(r)))
-
-  // Create filter for other user's reactions
-  const filter: Discord.CollectorFilter = (reaction: Discord.MessageReaction, user: Discord.User) => {
-    if (user.id === message.author.id) return false
-    return true
-  }
-  const collector = message.createReactionCollector(filter)
-  collector.on('collect', async (reaction, collector) => {
-    try {
-      // If unrecognised reaction, remove all occurences of it!
-      if (!CONTROL_REACTIONS.includes(reaction.emoji.name)) return await Promise.all(reaction.users.map(user => reaction.remove(user)))
-      // Otherwise handle the reaction and remove only instances of this reaction that aren't from the bot
-      await CONTROL_ACTIONS[reaction.emoji.name]()
-      await Promise.all(reaction.users.filter(u => u.id !== commandChannel.guild.me.id).map(user => reaction.remove(user)))
-    } catch (e) {
-      console.error(`Error removing reaction "${reaction.emoji.name}" from message ${reaction.message.id}`)
-    }
-  })
-
-  return message
+  return { message, update }
 }
 
 ;(async () => {
@@ -177,10 +130,10 @@ const createOrUpdateGuildGameControlMessage = async (guild: Discord.Guild, comma
         await bluebirdMap(
           npApi.player.open_games.sort((a, b) => a.number < b.number ? -1 : 1),
           async game => {
-            const controlMessage = await createOrUpdateGuildGameControlMessage(guild, commandChannel, game)
+            const { message, update } = await getGuildGameControlMessage(commandChannel, game, npApi)
             const gameApi = npApi.games.get(game.number)
             if (gameApi) {
-              gameApi.on(GAME_EVENTS.TICK_CHANGE, () => updateGuildControlMessage(guild, controlMessage, game))
+              gameApi.on(GAME_EVENTS.UNIVERSE_UPDATE, update)
             }
           }
         )

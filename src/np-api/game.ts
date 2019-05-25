@@ -59,32 +59,31 @@ export class Game extends EventEmitter {
     return `<Game: ${this.gameId} "${this.name}">`
   }
 
-  setUniverse(universe: Universe) {
-    this.universe = universe
+  async setUniverse(newUniverse: Universe) {
+    const oldUniverse = this.universe
+
+    this.universe = newUniverse
+
+    if (newUniverse.isReal) {
+
+      this.emit(GAME_EVENTS.UNIVERSE_UPDATE)
+
+      if (oldUniverse.isSameGame(newUniverse)
+        && oldUniverse.tick !== newUniverse.tick) {
+        if (this.universe.turnBased) {
+          this.emit(GAME_EVENTS.TURN_CHANGE, newUniverse.tick)
+        }
+        this.emit(GAME_EVENTS.TICK_CHANGE, newUniverse.tick)
+      }
+    }
+
+    await this.saveUniverse()
   }
 
   async handleOrderResponse(res: ApiOrderResponse): Promise<Universe> {
     if (res.event === 'order:full_universe') {
-
       const newUniverse = new Universe(this.gameId, res.report)
-
-      if (this.universe.isReal) {
-
-        this.emit(GAME_EVENTS.UNIVERSE_UPDATE)
-
-        if (this.universe.isSameGame(newUniverse)
-          && this.universe.tick !== newUniverse.tick) {
-          if (this.universe.turnBased) {
-            this.emit(GAME_EVENTS.TURN_CHANGE, newUniverse.tick)
-          }
-          this.emit(GAME_EVENTS.TICK_CHANGE, newUniverse.tick)
-        }
-      }
-
-      this.universe = newUniverse
-
-      await this.saveUniverse()
-
+      await this.setUniverse(newUniverse)
     } else if (res.event !== 'order:ok') {
       throw Error(`Unexpected order response: ${res.event}, (${JSON.stringify(res)})`)
     }
@@ -176,6 +175,7 @@ export class Game extends EventEmitter {
       console.log(`Cache data not found for game ${this.gameId}, fetching...`)
       universe = await this.getUniverse()
     }
+    this.setUniverse(universe)
     return universe
   }
 
@@ -189,8 +189,8 @@ export class Game extends EventEmitter {
     const filePath = this.getUniverseFilePath()
     if (!fs.existsSync(filePath))
       throw Error(`Could not load universe from "${filePath}", file does not exist.`)
-    return readFileP(filePath, 'utf8')
-      .then((data: string) => new Universe(this.gameId, JSON.parse(data)))
+    const data = await readFileP(filePath, 'utf8')
+    return new Universe(this.gameId, JSON.parse(data))
   }
 
   async splitShipsToFleets(star: Star) : Promise<Universe> {
@@ -216,7 +216,7 @@ export class Game extends EventEmitter {
 
   startRefresh() {
     this.stopRefresh()
-    this.refreshTimer = setInterval(async () => {
+    const refresh = async () => {
       try {
         this.emit(GAME_EVENTS.UNIVERSE_REFRESH_START)
         await this.getUniverse()
@@ -225,7 +225,9 @@ export class Game extends EventEmitter {
         this.emit(GAME_EVENTS.UNIVERSE_REFRESH_ERROR)
         console.error(`Error refreshing game ${this.gameId}`, e)
       }
-    }, AUTO_REFRESH_DELAY)
+      this.startRefresh()
+    }
+    this.refreshTimer = setTimeout(refresh, AUTO_REFRESH_DELAY)
   }
 
   resetRefresh() {

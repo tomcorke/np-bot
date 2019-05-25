@@ -34,7 +34,8 @@ export interface RawUniverseData {
 }
 
 export const EMPTY_UNIVERSE_DATA: RawUniverseData = {
-  isFakeUniverse: false,
+
+  isFakeUniverse: true,
 
   name: 'Empty universe',
   player_uid: -1,
@@ -90,7 +91,7 @@ export class Universe {
 
   constructor(gameId: string, data: RawUniverseData) {
 
-    this.isReal = data.isFakeUniverse !== undefined ? !data.isFakeUniverse : true
+    this.isReal = data.isFakeUniverse === undefined || !data.isFakeUniverse
 
     this.gameId = gameId
     this.name = decodeHTMLEntities(data.name)
@@ -174,6 +175,8 @@ export class Universe {
   }
 
   isSameGame(other: Universe) {
-    return this.gameId === other.gameId
+    return this.isReal === other.isReal
+      && this.gameId === other.gameId
+      && this.name === other.name
   }
 }
