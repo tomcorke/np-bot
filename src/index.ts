@@ -2,13 +2,13 @@ import Discord from 'discord.js'
 import { map as bluebirdMap } from 'bluebird'
 import chalk from 'chalk'
 
-import { initDiscord, getGuildHelpers } from './discord'
+import { initDiscord, getGuildHelpers, getOrCreateTextChannel } from './discord'
 import {
   decodeHTMLEntities
 } from './util'
 
-import { saveConfig } from './config'
-import { GuildConfig, getCommandChannel, getGameConfig, getGameNotificationChannel, getGuildConfig } from './config/guild'
+import { config, saveConfig } from './config'
+import { GuildConfig, getCommandChannel, getGameConfig, getGameNotificationChannel, getGuildConfig, hasGameConfig } from './config/guild'
 import { MissingPermissionsError } from './errors';
 import { GAME_EVENTS, Game } from './np-api/game';
 import NeptunesPrideApi from './np-api';
@@ -61,6 +61,7 @@ const getGuildGameControlMessageContent = async (guild: Discord.Guild, game: Raw
     .setTitle(decodeHTMLEntities(game.name))
     .setURL(`https://np.ironhelmet.com/game/${game.number}`)
     .setDescription(decodeHTMLEntities(game.config.description))
+    .setFooter(`Game ID: ${game.number}, last updated ${new Date(Date.now()).toLocaleString()}`)
     .addField('Players', `${game.players}/${game.maxPlayers}`, true)
     .addField('Status', game.status, true)
 
@@ -74,7 +75,9 @@ const getGuildGameControlMessageContent = async (guild: Discord.Guild, game: Raw
   content
     .addField('Notifications', gameConfig.notificationsEnabled, true)
     .addField('Notification channel', `#${notificationChannel.name}`, true)
-    .setTimestamp(Date.now())
+
+  if (gameConfig.ignored)
+    content.addField('Ignored', !!gameConfig.ignored, true)
 
   return content
 }
@@ -103,64 +106,115 @@ const getGuildGameControlMessage = async (channel: Discord.TextChannel, game: Ra
   return { message, update }
 }
 
+const guildEventListen = (api: NeptunesPrideApi, discordClient: Discord.Client, event: GAME_EVENTS, listener: (guild: Discord.Guild, game: Game, ...args: any[]) => Promise<void> | void) => {
+  api.on(event, async (game: Game, ...args: any[]) => {
+    try {
+      await bluebirdMap(
+        discordClient.guilds.array(),
+        async guild => {
+          try {
+            await listener(guild, game, ...args)
+          } catch (e) {
+            console.error(`Error handling event "${event}" for guild "${guild.name}"`, e)
+          }
+        },
+        { concurrency: 1 }
+      )
+    } catch (e) {
+      console.error(`Error handling event "${event}"`, e)
+    }
+  })
+}
+
+const initGuild = async (api: NeptunesPrideApi, guild: Discord.Guild) => {
+  let guildConfig: GuildConfig
+  let commandChannel: Discord.TextChannel
+
+  await api.updatePlayerGames()
+
+  try {
+    guildConfig = await getGuildConfig(guild)
+    commandChannel = await getCommandChannel(guild)
+  } catch (e) {
+    if (e instanceof MissingPermissionsError) {
+      console.log(chalk.red(`Bot not running for server "${guild.name}" due to missing permissions`))
+      return
+    }
+    throw e
+  }
+
+  await commandChannel.fetchMessages()
+  const gameControlMessageIds = Object.values(guildConfig.games).map(g => g.controlMessageId)
+  await Promise.all(commandChannel.messages.map(async m => {
+    if (m.createdTimestamp > commandChannel.guild.me.joinedTimestamp
+      && m.deletable
+      && !m.pinned
+      && !gameControlMessageIds.includes(m.id)) {
+      console.log(`Deleting message ${m.id}`)
+      await m.delete()
+    }
+  }))
+
+  await bluebirdMap(
+    api.player.open_games.sort((a, b) => a.number < b.number ? -1 : 1),
+    async game => {
+      const { message, update } = await getGuildGameControlMessage(commandChannel, game, api)
+      const gameConfig = getGameConfig(guildConfig, game.number)
+      gameConfig.updateControlMessage = update
+      const gameApi = api.games.get(game.number)
+      if (gameApi) {
+        gameApi.on(GAME_EVENTS.UNIVERSE_UPDATE, update)
+      }
+    }
+  )
+}
+
 ;(async () => {
   try {
     const npApi = await initNeptunesPrideApi()
-    await npApi.updatePlayerGames()
 
     const { discordClient } = await initDiscord()
 
     await bluebirdMap(
       discordClient.guilds.array(),
-      async guild => {
-
-        let guildConfig: GuildConfig
-        let commandChannel: Discord.TextChannel
-        try {
-          guildConfig = await getGuildConfig(guild)
-          commandChannel = await getCommandChannel(guild)
-        } catch (e) {
-          if (e instanceof MissingPermissionsError) {
-            console.log(chalk.red(`Bot not running for server "${guild.name}" due to missing permissions`))
-            return
-          }
-          throw e
-        }
-
-        await bluebirdMap(
-          npApi.player.open_games.sort((a, b) => a.number < b.number ? -1 : 1),
-          async game => {
-            const { message, update } = await getGuildGameControlMessage(commandChannel, game, npApi)
-            const gameApi = npApi.games.get(game.number)
-            if (gameApi) {
-              gameApi.on(GAME_EVENTS.UNIVERSE_UPDATE, update)
-            }
-          }
-        )
-
-      },
+      async guild => initGuild(npApi, guild),
       { concurrency: 1 }
     )
 
-    const guildEventListen = (event: GAME_EVENTS, listener: (guild: Discord.Guild, game: Game, ...args: any[]) => Promise<void> | void) => {
-      npApi.on(event, async (game: Game, ...args: any[]) => {
-        try {
-          await bluebirdMap(
-            discordClient.guilds.array(),
-            async guild => {
-              try {
-                await listener(guild, game, ...args)
-              } catch (e) {
-                console.error(`Error handling event "${event}" for guild "${guild.name}"`, e)
-              }
-            },
-            { concurrency: 1 }
-          )
-        } catch (e) {
-          console.error(`Error handling event "${event}"`, e)
+    discordClient.on('guildCreate', (guild: Discord.Guild) => initGuild(npApi, guild))
+
+    discordClient.on('message', async (message: Discord.Message) => {
+      const commandChannel = await getCommandChannel(message.guild)
+      const guildConfig = await getGuildConfig(message.guild)
+      if (message.channel.id === commandChannel.id && message.author.id !== message.guild.me.id) {
+        if (message.content.startsWith('!ignoreGame')) {
+          const args = message.content.split(/\s+/)
+          const gameId = args[1]
+          if (gameId && npApi.player.open_games.some(game => game.number === gameId)) {
+            const gameConfig = await getGameConfig(guildConfig, gameId)
+            gameConfig.ignored = !gameConfig.ignored;
+            if (gameConfig.updateControlMessage) await gameConfig.updateControlMessage()
+          }
         }
-      })
-    }
+        try {
+          console.log(`Deleting message ${message.id}`)
+          await message.delete()
+        } catch (e) {
+          // This is fine, I guess
+        }
+      }
+    })
+
+    // Register game event handlers for all guilds
+    guildEventListen(npApi, discordClient, GAME_EVENTS.TURN_CHANGE, async (guild: Discord.Guild, game: Game, tick: number) => {
+      const helpers = getGuildHelpers(guild)
+      const guildConfig = await getGuildConfig(guild)
+      const gameConfig = await getGameConfig(guildConfig, game.gameId)
+      if (gameConfig.notificationsEnabled) {
+        const notificationChannel = await getOrCreateTextChannel(discordClient, guild, config.defaultNotificationChannelName, gameConfig.notificationChannelId)
+        await notificationChannel.send(`Tick tock! Turn change in game "${game.universe.name}", now on tick ${tick}`)
+      }
+    })
 
     // Fetch initial universes
     await bluebirdMap(
@@ -169,13 +223,6 @@ const getGuildGameControlMessage = async (channel: Discord.TextChannel, game: Ra
         await game.loadOrGetUniverse()
       }
     )
-
-    // Register game event handlers
-    guildEventListen(GAME_EVENTS.TURN_CHANGE, async (guild: Discord.Guild, game: Game, tick: number) => {
-      const helpers = getGuildHelpers(guild)
-      const logChannel = await helpers.getOrCreateTextChannel('bot-log')
-      logChannel.send(`Tick tock! Turn change in game "${game.universe.name}", now on tick ${tick}`)
-    })
 
     // Start auto-refresh of games
     for (let game of npApi.games.values()) {

@@ -1,16 +1,18 @@
 import Discord from 'discord.js'
 import chalk from 'chalk'
 
-export interface GameConfig {
-  controlMessageId?: string
-  notificationsEnabled: boolean
-  notificationChannelId?: string
-}
-
 export interface GuildConfig {
   name: string
   commandChannelId?: string
   games: { [gameId: string]: GameConfig }
+}
+
+export interface GameConfig {
+  controlMessageId?: string
+  notificationsEnabled: boolean
+  notificationChannelId?: string
+  ignored?: boolean
+  updateControlMessage?: (...args: any[]) => Promise<void>
 }
 
 import { config, saveConfig } from '.'
@@ -26,8 +28,6 @@ const expectedPermissions = [
   'READ_MESSAGE_HISTORY',
   'SEND_MESSAGES',
   'ADD_REACTIONS',
-  'CHANGE_NICKNAME',
-  'MANAGE_NICKNAMES',
 ] as const
 
 const initGuild = async (guild: Discord.Guild) => {
@@ -60,7 +60,11 @@ const initGuild = async (guild: Discord.Guild) => {
       'as an evil overlord',
       'with your heart',
       'a tiny violin',
-      'internet spaceships'
+      'internet spaceships',
+      'with ur economy',
+      'with ur science',
+      'with ur stars',
+      'with ur carriers',
     ]
     try {
       await guild.client.user.setPresence({ game: { name: gameMessages[Math.floor(Math.random() * gameMessages.length)] }, status: 'online' })
@@ -104,6 +108,10 @@ export const getGameNotificationChannel = async (guild: Discord.Guild, gameId: s
   }
   guildGameConfig.notificationChannelId = gameNotificationChannel.id
   return gameNotificationChannel
+}
+
+export const hasGameConfig = (guildConfig: GuildConfig, gameId: string) => {
+  return guildConfig.games[gameId] !== undefined
 }
 
 export const getGameConfig = (guildConfig: GuildConfig, gameId: string) => {

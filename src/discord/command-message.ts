@@ -37,6 +37,7 @@ export const getOrCreateCommandMessage = async (options: CommandMessageOptions) 
   // Create new placeholder message if no existing message
   let newMessage: Discord.Message | Discord.Message[] = []
   if (!existingMessage) {
+    console.log(`Creating new message...`)
     newMessage = await channel.send('...')
   }
 
