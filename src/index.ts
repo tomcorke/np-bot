@@ -7,8 +7,8 @@ import {
   decodeHTMLEntities
 } from './util'
 
-import { config, saveConfig } from './config'
-import { GuildConfig, getCommandChannel, getGameConfig, getGameNotificationChannel, getGuildConfig, hasGameConfig } from './config/guild'
+import { config } from './config'
+import { FileGuildConfig, getCommandChannel, getGameConfig, getGameNotificationChannel, getGuildConfig } from './config/guild'
 import { MissingPermissionsError } from './errors';
 import { GAME_EVENTS, Game } from './np-api/game';
 import NeptunesPrideApi from './np-api';
@@ -94,14 +94,14 @@ const getGuildGameControlMessage = async (channel: Discord.TextChannel, game: Ra
     reactions: {
       '💬': async (update) => {
         gameConfig.notificationsEnabled = !gameConfig.notificationsEnabled
-        saveConfig()
+        config.save()
         return update()
       }
     }
   })
 
   gameConfig.controlMessageId = message.id
-  saveConfig()
+  await config.save()
 
   return { message, update }
 }
@@ -127,7 +127,7 @@ const guildEventListen = (api: NeptunesPrideApi, discordClient: Discord.Client, 
 }
 
 const initGuild = async (api: NeptunesPrideApi, guild: Discord.Guild) => {
-  let guildConfig: GuildConfig
+  let guildConfig: FileGuildConfig
   let commandChannel: Discord.TextChannel
 
   await api.updatePlayerGames()
@@ -211,7 +211,7 @@ const initGuild = async (api: NeptunesPrideApi, guild: Discord.Guild) => {
       const guildConfig = await getGuildConfig(guild)
       const gameConfig = await getGameConfig(guildConfig, game.gameId)
       if (gameConfig.notificationsEnabled) {
-        const notificationChannel = await getOrCreateTextChannel(discordClient, guild, config.defaultNotificationChannelName, gameConfig.notificationChannelId)
+        const notificationChannel = await getOrCreateTextChannel(discordClient, guild, config.get('defaultNotificationChannelName'), gameConfig.notificationChannelId)
         await notificationChannel.send(`Tick tock! Turn change in game "${game.universe.name}", now on tick ${tick}`)
       }
     })

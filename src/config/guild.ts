@@ -1,25 +1,18 @@
 import Discord from 'discord.js'
 import chalk from 'chalk'
 
-export interface GuildConfig {
-  name: string
-  commandChannelId?: string
-  games: { [gameId: string]: GameConfig }
-}
-
-export interface GameConfig {
-  controlMessageId?: string
-  notificationsEnabled: boolean
-  notificationChannelId?: string
-  ignored?: boolean
-  updateControlMessage?: (...args: any[]) => Promise<void>
-}
-
-import { config, saveConfig } from '.'
+import { config } from '.'
 import { MissingPermissionsError } from '../errors'
 import { getGuildHelpers } from '../discord'
+import { FileGameConfig } from './game';
 
-const guildConfigs: { [guildId: string]: GuildConfig } = {}
+export interface FileGuildConfig {
+  name: string
+  commandChannelId?: string
+  games: { [gameId: string]: FileGameConfig }
+}
+
+const guildConfigs: { [guildId: string]: FileGuildConfig } = {}
 
 const expectedPermissions = [
   'MANAGE_CHANNELS',
@@ -32,7 +25,7 @@ const expectedPermissions = [
 
 const initGuild = async (guild: Discord.Guild) => {
 
-  const partialGuildConfig: Partial<GuildConfig> = config.guilds[guild.id] || {}
+  const partialGuildConfig: Partial<FileGuildConfig> = config.get('guilds')[guild.id] || {}
 
   const botMember = guild.me
 
@@ -43,13 +36,13 @@ const initGuild = async (guild: Discord.Guild) => {
     throw new MissingPermissionsError(`Bot is missing expected permissions in server "${guild.name}": ${JSON.stringify(missingPermissions)}`)
   }
 
-  const guildConfig: GuildConfig = {
+  const guildConfig: FileGuildConfig = {
     ...partialGuildConfig,
     name: guild.name,
     games: partialGuildConfig.games || {}
   }
 
-  config.guilds[guild.id] = guildConfig
+  config.get('guilds')[guild.id] = guildConfig
   guildConfigs[guild.id] = guildConfig
 
   const setRandomPresence = async () => {
@@ -76,21 +69,21 @@ const initGuild = async (guild: Discord.Guild) => {
   await setRandomPresence()
   setInterval(setRandomPresence, 60000)
 
-  saveConfig()
+  config.save()
 
   return guildConfig
 }
 
 export const getGuildConfig = async (guild: Discord.Guild) => {
   const guildConfig = guildConfigs[guild.id] || await initGuild(guild)
-  config.guilds[guild.id] = guildConfig
+  config.get('guilds')[guild.id] = guildConfig
   return guildConfig
 }
 
 export const getCommandChannel = async (guild: Discord.Guild) => {
   const guildConfig = guildConfigs[guild.id] || await initGuild(guild)
   const helpers = getGuildHelpers(guild)
-  const commandChannel = await helpers.getOrCreateTextChannel(config.defaultCommandChannelName, guildConfig.commandChannelId)
+  const commandChannel = await helpers.getOrCreateTextChannel(config.get('defaultCommandChannelName'), guildConfig.commandChannelId)
   if (!commandChannel) {
     throw Error(`Could not get or create command channel for guild ${guild.name}`)
   }
@@ -102,7 +95,7 @@ export const getGameNotificationChannel = async (guild: Discord.Guild, gameId: s
   const guildConfig = guildConfigs[guild.id] || await initGuild(guild)
   const guildGameConfig = getGameConfig(guildConfig, gameId)
   const helpers = getGuildHelpers(guild)
-  const gameNotificationChannel = await helpers.getOrCreateTextChannel(config.defaultNotificationChannelName, guildGameConfig.notificationChannelId)
+  const gameNotificationChannel = await helpers.getOrCreateTextChannel(config.get('defaultNotificationChannelName'), guildGameConfig.notificationChannelId)
   if (!gameNotificationChannel) {
     throw Error(`Could not get or create game notification channel for guild ${guild.name}, game ${gameId}`)
   }
@@ -110,11 +103,11 @@ export const getGameNotificationChannel = async (guild: Discord.Guild, gameId: s
   return gameNotificationChannel
 }
 
-export const hasGameConfig = (guildConfig: GuildConfig, gameId: string) => {
+export const hasGameConfig = (guildConfig: FileGuildConfig, gameId: string) => {
   return guildConfig.games[gameId] !== undefined
 }
 
-export const getGameConfig = (guildConfig: GuildConfig, gameId: string) => {
+export const getGameConfig = (guildConfig: FileGuildConfig, gameId: string) => {
   const gameConfig = guildConfig.games[gameId] = guildConfig.games[gameId] || {
     notificationsEnabled: true
   }
