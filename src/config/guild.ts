@@ -1,18 +1,24 @@
 import Discord from 'discord.js'
 import chalk from 'chalk'
 
-import { config } from '.'
+import { Config } from '.'
 import { MissingPermissionsError } from '../errors'
 import { getGuildHelpers } from '../discord'
-import { FileGameConfig } from './game';
+import { FileGameConfig, GameConfig } from './game';
+import { RawPlayerGameData } from '../np-api/player';
+import NeptunesPrideApi from '../np-api';
 
 export interface FileGuildConfig {
-  name: string
   commandChannelId?: string
   games: { [gameId: string]: FileGameConfig }
 }
 
-const guildConfigs: { [guildId: string]: FileGuildConfig } = {}
+const DEFAULT_GUILD_CONFIG: FileGuildConfig = {
+  games: {}
+}
+
+type CONTROLLED_PROPS = 'games'
+type UncontrolledFileGuildConfig = Pick<FileGuildConfig, Exclude<keyof FileGuildConfig, CONTROLLED_PROPS>>
 
 const expectedPermissions = [
   'MANAGE_CHANNELS',
@@ -23,93 +29,109 @@ const expectedPermissions = [
   'ADD_REACTIONS',
 ] as const
 
-const initGuild = async (guild: Discord.Guild) => {
 
-  const partialGuildConfig: Partial<FileGuildConfig> = config.get('guilds')[guild.id] || {}
+export class GuildConfig implements BaseConfig {
 
-  const botMember = guild.me
+  fileGuildConfig: FileGuildConfig
 
-  const missingPermissions = expectedPermissions.filter(p => !botMember.hasPermission(p, false, false, false))
-  if (missingPermissions.length > 0) {
-    console.log(`Bot is missing expected permissions in server "${guild.name}":`)
-    console.log(chalk.red(JSON.stringify(missingPermissions)))
-    throw new MissingPermissionsError(`Bot is missing expected permissions in server "${guild.name}": ${JSON.stringify(missingPermissions)}`)
-  }
+  config: Config
+  guild: Discord.Guild
+  private games: Map<string, GameConfig> = new Map<string, GameConfig>()
 
-  const guildConfig: FileGuildConfig = {
-    ...partialGuildConfig,
-    name: guild.name,
-    games: partialGuildConfig.games || {}
-  }
+  presenceUpdateTimer?: NodeJS.Timeout
 
-  config.get('guilds')[guild.id] = guildConfig
-  guildConfigs[guild.id] = guildConfig
+  constructor(config: Config, guild: Discord.Guild) {
+    this.config = config
+    this.guild = guild
 
-  const setRandomPresence = async () => {
-    const gameMessages = [
-      'in ur galaxy',
-      'with ur industries',
-      'with ur ships',
-      'as an evil overlord',
-      'with your heart',
-      'a tiny violin',
-      'internet spaceships',
-      'with ur economy',
-      'with ur science',
-      'with ur stars',
-      'with ur carriers',
-    ]
-    try {
-      await guild.client.user.setPresence({ game: { name: gameMessages[Math.floor(Math.random() * gameMessages.length)] }, status: 'online' })
-    } catch (e) {
-      // Whatever
+    const guildConfig: FileGuildConfig = { ...DEFAULT_GUILD_CONFIG, ...config.fileConfig.guilds[guild.id] }
+    this.fileGuildConfig = guildConfig
+
+    const botMember = guild.me
+
+    const missingPermissions = expectedPermissions.filter(p => !botMember.hasPermission(p, false, false, false))
+    if (missingPermissions.length > 0) {
+      console.log(`Bot is missing expected permissions in server "${guild.name}":`)
+      console.log(chalk.red(JSON.stringify(missingPermissions)))
+      throw new MissingPermissionsError(`Bot is missing expected permissions in server "${guild.name}": ${JSON.stringify(missingPermissions)}`)
     }
+
+    const setRandomPresence = async () => {
+      const gameMessages = [
+        'in ur galaxy',
+        'with ur industries',
+        'with ur ships',
+        'as an evil overlord',
+        'with your heart',
+        'a tiny violin',
+        'internet spaceships',
+        'with ur economy',
+        'with ur science',
+        'with ur stars',
+        'with ur carriers',
+      ]
+      try {
+        await guild.client.user.setPresence({ game: { name: gameMessages[Math.floor(Math.random() * gameMessages.length)] }, status: 'online' })
+      } catch (e) {
+        // Whatever
+      }
+    }
+
+    setRandomPresence()
+    this.presenceUpdateTimer = setInterval(setRandomPresence, 60000)
+
+    // Initialise existing games for this guild
+    Object.keys(guildConfig.games).forEach(gameId => this.getGameConfig(gameId))
   }
 
-  await setRandomPresence()
-  setInterval(setRandomPresence, 60000)
-
-  config.save()
-
-  return guildConfig
-}
-
-export const getGuildConfig = async (guild: Discord.Guild) => {
-  const guildConfig = guildConfigs[guild.id] || await initGuild(guild)
-  config.get('guilds')[guild.id] = guildConfig
-  return guildConfig
-}
-
-export const getCommandChannel = async (guild: Discord.Guild) => {
-  const guildConfig = guildConfigs[guild.id] || await initGuild(guild)
-  const helpers = getGuildHelpers(guild)
-  const commandChannel = await helpers.getOrCreateTextChannel(config.get('defaultCommandChannelName'), guildConfig.commandChannelId)
-  if (!commandChannel) {
-    throw Error(`Could not get or create command channel for guild ${guild.name}`)
+  get api() {
+    return this.config.api
   }
-  guildConfig.commandChannelId = commandChannel.id
-  return commandChannel
-}
 
-export const getGameNotificationChannel = async (guild: Discord.Guild, gameId: string) => {
-  const guildConfig = guildConfigs[guild.id] || await initGuild(guild)
-  const guildGameConfig = getGameConfig(guildConfig, gameId)
-  const helpers = getGuildHelpers(guild)
-  const gameNotificationChannel = await helpers.getOrCreateTextChannel(config.get('defaultNotificationChannelName'), guildGameConfig.notificationChannelId)
-  if (!gameNotificationChannel) {
-    throw Error(`Could not get or create game notification channel for guild ${guild.name}, game ${gameId}`)
+  get<T extends keyof UncontrolledFileGuildConfig>(prop: T) {
+    return this.fileGuildConfig[prop]
   }
-  guildGameConfig.notificationChannelId = gameNotificationChannel.id
-  return gameNotificationChannel
-}
 
-export const hasGameConfig = (guildConfig: FileGuildConfig, gameId: string) => {
-  return guildConfig.games[gameId] !== undefined
-}
-
-export const getGameConfig = (guildConfig: FileGuildConfig, gameId: string) => {
-  const gameConfig = guildConfig.games[gameId] = guildConfig.games[gameId] || {
-    notificationsEnabled: true
+  set<T extends keyof UncontrolledFileGuildConfig, V extends FileGuildConfig[T]>(prop: T, value: V) {
+    console.log(`guildConfig set`, prop, value)
+    this.fileGuildConfig[prop] = value
+    this.config.save()
   }
-  return gameConfig
+
+  async getCommandChannel() {
+    const helpers = getGuildHelpers(this.guild)
+    const commandChannelId = this.get('commandChannelId')
+    const commandChannel = await helpers.getOrCreateTextChannel(this.config.get('defaultCommandChannelName'), commandChannelId)
+    if (!commandChannel) {
+      throw Error(`Could not get or create command channel for guild ${this.guild.name}`)
+    }
+    if (commandChannelId !== commandChannel.id) {
+      this.set('commandChannelId', commandChannel.id)
+      this.save()
+    }
+    return commandChannel
+  }
+
+  getGameConfig(gameId: string) {
+    const existingGameConfig = this.games.get(gameId)
+    if (existingGameConfig) return existingGameConfig
+
+    const gameConfig = new GameConfig(this, gameId)
+    this.fileGuildConfig.games[gameId] = gameConfig.fileGameConfig
+    this.games.set(gameId, gameConfig)
+    this.save()
+    return gameConfig
+  }
+
+  getGameConfigs() {
+    return Array.from(this.games.keys()).map(gameId => this.getGameConfig(gameId))
+  }
+
+  save() {
+    this.config.save()
+  }
+
+  dispose() {
+    if (this.presenceUpdateTimer) clearInterval(this.presenceUpdateTimer)
+  }
 }

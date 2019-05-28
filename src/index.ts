@@ -7,8 +7,8 @@ import {
   decodeHTMLEntities
 } from './util'
 
-import { config } from './config'
-import { FileGuildConfig, getCommandChannel, getGameConfig, getGameNotificationChannel, getGuildConfig } from './config/guild'
+import { config, getConfig, Config } from './config'
+import { GuildConfig } from './config/guild'
 import { MissingPermissionsError } from './errors';
 import { GAME_EVENTS, Game } from './np-api/game';
 import NeptunesPrideApi from './np-api';
@@ -50,61 +50,6 @@ const initNeptunesPrideApi = async () => {
   return api
 }
 
-const getGuildGameControlMessageContent = async (guild: Discord.Guild, game: RawPlayerGameData, api: NeptunesPrideApi) => {
-  const guildConfig = await getGuildConfig(guild)
-  const gameConfig = await getGameConfig(guildConfig, game.number)
-  const gameObject = await api.games.get(game.number)
-
-  const notificationChannel = await getGameNotificationChannel(guild, game.number)
-
-  const content = new Discord.RichEmbed()
-    .setTitle(decodeHTMLEntities(game.name))
-    .setURL(`https://np.ironhelmet.com/game/${game.number}`)
-    .setDescription(decodeHTMLEntities(game.config.description))
-    .setFooter(`Game ID: ${game.number}, last updated ${new Date(Date.now()).toLocaleString()}`)
-    .addField('Players', `${game.players}/${game.maxPlayers}`, true)
-    .addField('Status', game.status, true)
-
-  if (gameObject && gameObject.universe.isReal) {
-    content.addField('Game tick', gameObject.universe.tick, true)
-    if (gameObject.universe.turnBased) {
-      content.addField('Game turn', gameObject.universe.tick / gameObject.universe.tickRate, true)
-    }
-  }
-
-  content
-    .addField('Notifications', gameConfig.notificationsEnabled, true)
-    .addField('Notification channel', `#${notificationChannel.name}`, true)
-
-  if (gameConfig.ignored)
-    content.addField('Ignored', !!gameConfig.ignored, true)
-
-  return content
-}
-
-const getGuildGameControlMessage = async (channel: Discord.TextChannel, game: RawPlayerGameData, api: NeptunesPrideApi) => {
-
-  const guildConfig = await getGuildConfig(channel.guild)
-  const gameConfig = await getGameConfig(guildConfig, game.number)
-
-  const { message, update } = await getOrCreateCommandMessage({
-    channel,
-    messageContentProducer: () => getGuildGameControlMessageContent(channel.guild, game, api),
-    messageId: gameConfig.controlMessageId,
-    reactions: {
-      '💬': async (update) => {
-        gameConfig.notificationsEnabled = !gameConfig.notificationsEnabled
-        config.save()
-        return update()
-      }
-    }
-  })
-
-  gameConfig.controlMessageId = message.id
-  await config.save()
-
-  return { message, update }
-}
 
 const guildEventListen = (api: NeptunesPrideApi, discordClient: Discord.Client, event: GAME_EVENTS, listener: (guild: Discord.Guild, game: Game, ...args: any[]) => Promise<void> | void) => {
   api.on(event, async (game: Game, ...args: any[]) => {
@@ -126,15 +71,15 @@ const guildEventListen = (api: NeptunesPrideApi, discordClient: Discord.Client, 
   })
 }
 
-const initGuild = async (api: NeptunesPrideApi, guild: Discord.Guild) => {
-  let guildConfig: FileGuildConfig
+const initGuild = async (config: Config, api: NeptunesPrideApi, guild: Discord.Guild) => {
+  let guildConfig: GuildConfig
   let commandChannel: Discord.TextChannel
 
   await api.updatePlayerGames()
 
   try {
-    guildConfig = await getGuildConfig(guild)
-    commandChannel = await getCommandChannel(guild)
+    guildConfig = await config.getGuildConfig(guild)
+    commandChannel = await guildConfig.getCommandChannel()
   } catch (e) {
     if (e instanceof MissingPermissionsError) {
       console.log(chalk.red(`Bot not running for server "${guild.name}" due to missing permissions`))
@@ -144,7 +89,7 @@ const initGuild = async (api: NeptunesPrideApi, guild: Discord.Guild) => {
   }
 
   await commandChannel.fetchMessages()
-  const gameControlMessageIds = Object.values(guildConfig.games).map(g => g.controlMessageId)
+  const gameControlMessageIds = guildConfig.getGameConfigs().map(g => g.get('controlMessageId'))
   await Promise.all(commandChannel.messages.map(async m => {
     if (m.createdTimestamp > commandChannel.guild.me.joinedTimestamp
       && m.deletable
@@ -158,8 +103,9 @@ const initGuild = async (api: NeptunesPrideApi, guild: Discord.Guild) => {
   await bluebirdMap(
     api.player.open_games.sort((a, b) => a.number < b.number ? -1 : 1),
     async game => {
-      const { message, update } = await getGuildGameControlMessage(commandChannel, game, api)
-      const gameConfig = getGameConfig(guildConfig, game.number)
+      const guildConfig = config.getGuildConfig(guild)
+      const gameConfig = guildConfig.getGameConfig(game.number)
+      const { message, update } = await gameConfig.getGuildGameControlMessage(commandChannel, game, api)
       gameConfig.updateControlMessage = update
       const gameApi = api.games.get(game.number)
       if (gameApi) {
@@ -169,30 +115,37 @@ const initGuild = async (api: NeptunesPrideApi, guild: Discord.Guild) => {
   )
 }
 
+const deleteGuild = async (config: Config, guild: Discord.Guild) => {
+  config.deleteGuild(guild)
+}
+
 ;(async () => {
   try {
-    const npApi = await initNeptunesPrideApi()
+    const api = await initNeptunesPrideApi()
+
+    const config = getConfig(api)
 
     const { discordClient } = await initDiscord()
 
     await bluebirdMap(
       discordClient.guilds.array(),
-      async guild => initGuild(npApi, guild),
+      async guild => initGuild(config, api, guild),
       { concurrency: 1 }
     )
 
-    discordClient.on('guildCreate', (guild: Discord.Guild) => initGuild(npApi, guild))
+    discordClient.on('guildCreate', (guild: Discord.Guild) => initGuild(config, api, guild))
+    discordClient.on('guildDelete', (guild: Discord.Guild) => deleteGuild(config, guild))
 
     discordClient.on('message', async (message: Discord.Message) => {
-      const commandChannel = await getCommandChannel(message.guild)
-      const guildConfig = await getGuildConfig(message.guild)
+      const guildConfig = config.getGuildConfig(message.guild)
+      const commandChannel = await guildConfig.getCommandChannel()
       if (message.channel.id === commandChannel.id && message.author.id !== message.guild.me.id) {
         if (message.content.startsWith('!ignoreGame')) {
           const args = message.content.split(/\s+/)
           const gameId = args[1]
-          if (gameId && npApi.player.open_games.some(game => game.number === gameId)) {
-            const gameConfig = await getGameConfig(guildConfig, gameId)
-            gameConfig.ignored = !gameConfig.ignored;
+          if (gameId && api.player.open_games.some(game => game.number === gameId)) {
+            const gameConfig = await guildConfig.getGameConfig(gameId)
+            gameConfig.set('ignored', !gameConfig.get('ignored'))
             if (gameConfig.updateControlMessage) await gameConfig.updateControlMessage()
           }
         }
@@ -206,26 +159,25 @@ const initGuild = async (api: NeptunesPrideApi, guild: Discord.Guild) => {
     })
 
     // Register game event handlers for all guilds
-    guildEventListen(npApi, discordClient, GAME_EVENTS.TURN_CHANGE, async (guild: Discord.Guild, game: Game, tick: number) => {
-      const helpers = getGuildHelpers(guild)
-      const guildConfig = await getGuildConfig(guild)
-      const gameConfig = await getGameConfig(guildConfig, game.gameId)
-      if (gameConfig.notificationsEnabled) {
-        const notificationChannel = await getOrCreateTextChannel(discordClient, guild, config.get('defaultNotificationChannelName'), gameConfig.notificationChannelId)
+    guildEventListen(api, discordClient, GAME_EVENTS.TURN_CHANGE, async (guild: Discord.Guild, game: Game, tick: number) => {
+      const guildConfig = await config.getGuildConfig(guild)
+      const gameConfig = await guildConfig.getGameConfig(game.gameId)
+      if (gameConfig.get('notificationsEnabled')) {
+        const notificationChannel = await getOrCreateTextChannel(discordClient, guild, config.get('defaultNotificationChannelName'), gameConfig.get('notificationChannelId'))
         await notificationChannel.send(`Tick tock! Turn change in game "${game.universe.name}", now on tick ${tick}`)
       }
     })
 
     // Fetch initial universes
     await bluebirdMap(
-      npApi.games.values(),
+      api.games.values(),
       async game => {
         await game.loadOrGetUniverse()
       }
     )
 
     // Start auto-refresh of games
-    for (let game of npApi.games.values()) {
+    for (let game of api.games.values()) {
       game.startRefresh()
     }
 
